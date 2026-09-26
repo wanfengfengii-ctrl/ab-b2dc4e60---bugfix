@@ -318,3 +318,21 @@ test('wide search space (10 traces, up to 100 missing per gap) stays fast', () =
   assert.ok(r.spacing > 0);
   assert.ok(ms < 5000, `took ${ms}ms`);
 });
+
+test('dense prefix followed by a distant trace stays within budget', () => {
+  // Boundary regression: pairs among the dense traces cannot bound d (their
+  // dx is dwarfed by 2R), so the far trace must prune the step space via
+  // lookahead. Global optimum: steps 1x8 then 101, spacing 1000000/109.
+  const x = [0, 1, 2, 3, 4, 5, 6, 7, 8, 1_000_000];
+  const maxGaps = Array(9).fill(100);
+  const t0 = performance.now();
+  const r = solve({ x, maxGaps, tolerance: 1_000_000 });
+  const ms = performance.now() - t0;
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.gapsFilled, [0, 0, 0, 0, 0, 0, 0, 0, 100]);
+  assert.deepEqual(r.indices, [1, 2, 3, 4, 5, 6, 7, 8, 9, 110]);
+  assert.ok(Math.abs(r.spacing - 1_000_000 / 109) < 1e-6, `spacing=${r.spacing}`);
+  assert.ok(Math.abs(r.maxDeviation - 3_999_564 / 109) < 1e-6, `maxDev=${r.maxDeviation}`);
+  assert.ok(r.maxDeviation <= 1_000_000, 'maxDeviation 超过限值');
+  assert.ok(ms < 5000, `took ${ms}ms`);
+});

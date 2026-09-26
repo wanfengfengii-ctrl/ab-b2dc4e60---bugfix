@@ -107,6 +107,22 @@ await check('复原 API 冒烟：全局裁决（非逐段取整）', async () =>
   assert(body.maxDeviation <= 1, 'maxDeviation 超过限值');
 });
 
+await check('复原 API 冒烟：远端残迹边界（密集前缀 + 大缺线上限）', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [0, 1, 2, 3, 4, 5, 6, 7, 8, 1000000],
+    maxGaps: [100, 100, 100, 100, 100, 100, 100, 100, 100],
+    tolerance: 1000000,
+  });
+  assert(status === 200, `HTTP ${status}`);
+  assert(body.ok === true, `body.ok !== true（code=${body.code}）`);
+  assert(
+    JSON.stringify(body.gapsFilled) === JSON.stringify([0, 0, 0, 0, 0, 0, 0, 0, 100]),
+    `gapsFilled=${JSON.stringify(body.gapsFilled)}`,
+  );
+  assert(Math.abs(body.spacing - 1000000 / 109) < 1e-6, `spacing=${body.spacing}`);
+  assert(Math.abs(body.maxDeviation - 3999564 / 109) < 1e-4, `maxDeviation=${body.maxDeviation}`);
+});
+
 await check('复原 API 冒烟：不可行诊断', async () => {
   const { status, body } = await postJSON(`${API}/api/restore`, {
     x: [0, 10, 11, 20, 30],

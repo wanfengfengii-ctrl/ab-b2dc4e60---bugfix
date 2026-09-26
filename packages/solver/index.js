@@ -89,13 +89,44 @@ function prefixSums(steps) {
 // admit a common d > 0 (s is then the midpoint of the remaining intercept
 // interval). DFS assigns steps left to right and maintains the intersection
 // d-interval, which prunes the space to near-linear size in practice.
+//
+// Lookahead: a pair (i, j) whose step sum M = P_j - P_i is not fully assigned
+// at level t (j > t) still bounds d, because M must end up in
+// [j-i, maxStepSum(i, j)] — the pair forces d >= (x_j-x_i-2R)/maxStepSum(i,j)
+// and d <= (x_j-x_i+2R)/(j-i). Intersecting these a-priori bounds with the
+// running interval prunes branches no completion can satisfy. This matters
+// when dense nearby traces are followed by a distant one: pairs among the
+// dense traces alone cannot bound d (their dx is dwarfed by 2R), so without
+// lookahead the far trace's bound arrives only at the last level and the DFS
+// exhausts the whole step space.
 // ---------------------------------------------------------------------------
+
+function lookaheadDouble(x, maxGaps, twoR) {
+  const n = x.length;
+  const lb = new Array(n).fill(-Infinity);
+  const ub = new Array(n).fill(Infinity);
+  for (let i = 0; i < n; i++) {
+    let maxM = 0;
+    for (let j = i + 1; j < n; j++) {
+      maxM += maxGaps[j - 1] + 1;
+      const dx = x[j] - x[i];
+      const l = (dx - twoR) / maxM;
+      const u = (dx + twoR) / (j - i);
+      for (let t = 1; t < j; t++) {
+        if (l > lb[t]) lb[t] = l;
+        if (u < ub[t]) ub[t] = u;
+      }
+    }
+  }
+  return { lb, ub };
+}
 
 function dfsDouble(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
   const n = x.length;
   const P = new Array(n).fill(0);
   const steps = new Array(n - 1).fill(0);
   const twoR = 2 * R;
+  const look = lookaheadDouble(x, maxGaps, twoR);
   let leaves = 0;
 
   function rec(t, lo, hi) {
@@ -116,7 +147,7 @@ function dfsDouble(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
         if (l > lo2) lo2 = l;
         if (h < hi2) hi2 = h;
       }
-      if (lo2 <= hi2 && hi2 > 0) {
+      if (lo2 <= hi2 && hi2 > 0 && hi2 >= look.lb[t] && lo2 <= look.ub[t]) {
         if (t === n - 1) {
           leaves++;
           const stop = onLeaf(steps, P);
@@ -133,20 +164,65 @@ function dfsDouble(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
   return leaves;
 }
 
-function dfsExact(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
+function lookaheadExact(x, maxGaps, twoR) {
+  const n = x.length;
+  const lb = new Array(n).fill(null);
+  const ub = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    let maxM = 0n;
+    for (let j = i + 1; j < n; j++) {
+      maxM += BigInt(maxGaps[j - 1] + 1);
+      const dx = new Fr(BigInt(x[j] - x[i]));
+      const l = dx.sub(twoR).div(new Fr(maxM));
+      const u = dx.add(twoR).div(new Fr(BigInt(j - i)));
+      for (let t = 1; t < j; t++) {
+        if (lb[t] === null || l.gt(lb[t])) lb[t] = l;
+        if (ub[t] === null || u.lt(ub[t])) ub[t] = u;
+      }
+    }
+  }
+  return { lb, ub };
+}
+
+function dfsExact(x, maxGaps, R, budget, onLeaf, stopAtFirst, opts = null) {
   const n = x.length;
   const P = new Array(n).fill(0);
   const steps = new Array(n - 1).fill(0);
   const twoR = R.mul(fr2);
+  const look = lookaheadExact(x, maxGaps, twoR);
+  // Optional branch-and-bound on the final prefix sum P[n-1] (used by the
+  // failure diagnosis to find its extremes without enumerating every leaf):
+  // visit steps in the given direction and prune branches whose achievable
+  // P[n-1] range cannot improve the current best.
+  const descending = opts?.descending ?? false;
+  const pBound = opts?.pBound ?? null; // { isMin, getBest }
+  const minRem = new Array(n).fill(0);
+  const maxRem = new Array(n).fill(0);
+  if (pBound) {
+    for (let t = n - 2; t >= 1; t--) {
+      minRem[t] = minRem[t + 1] + 1;
+      maxRem[t] = maxRem[t + 1] + maxGaps[t] + 1;
+    }
+  }
   let leaves = 0;
 
   function rec(t, lo, hi) {
     if (++budget.count > budget.limit) throw new SearchBudgetError();
     const gMax = maxGaps[t - 1] + 1;
-    for (let g = 1; g <= gMax; g++) {
+    const gStart = descending ? gMax : 1;
+    const gStop = descending ? 0 : gMax + 1;
+    const gStep = descending ? -1 : 1;
+    for (let g = gStart; g !== gStop; g += gStep) {
       const Pt = P[t - 1] + g;
       P[t] = Pt;
       steps[t - 1] = g;
+      if (pBound) {
+        const best = pBound.getBest();
+        if (best !== null) {
+          if (pBound.isMin && Pt + minRem[t] >= best) continue;
+          if (!pBound.isMin && Pt + maxRem[t] <= best) continue;
+        }
+      }
       let lo2 = lo;
       let hi2 = hi;
       const xt = new Fr(BigInt(x[t]));
@@ -159,7 +235,10 @@ function dfsExact(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
         if (lo2 === null || l.gt(lo2)) lo2 = l;
         if (hi2 === null || h.lt(hi2)) hi2 = h;
       }
-      if (lo2 === null || (lo2.le(hi2) && hi2.gt(fr0))) {
+      let ok = lo2 === null || (lo2.le(hi2) && hi2.gt(fr0));
+      if (ok && look.lb[t] !== null && hi2 !== null && hi2.lt(look.lb[t])) ok = false;
+      if (ok && look.ub[t] !== null && lo2 !== null && lo2.gt(look.ub[t])) ok = false;
+      if (ok) {
         if (t === n - 1) {
           leaves++;
           const stop = onLeaf(steps, P);
@@ -378,13 +457,35 @@ function diagnose(x, maxGaps, tolFr, budget) {
     if (feasible) continue;
     const prevX = x.slice(0, e);
     const prevG = maxGaps.slice(0, e - 1);
-    let minP = Infinity;
-    let maxP = -Infinity;
-    dfsExact(prevX, prevG, tolFr, budget, (steps, P) => {
-      const last = P[e - 1];
-      if (last < minP) minP = last;
-      if (last > maxP) maxP = last;
-    }, false);
+    // Min/max index of trace e-1 over all feasible prefix fits. Two
+    // branch-and-bound searches (ascending for the min, descending for the
+    // max) — a plain enumeration is exponential when the prefix is loose.
+    let minP = null;
+    dfsExact(
+      prevX,
+      prevG,
+      tolFr,
+      budget,
+      (steps, P) => {
+        const last = P[e - 1];
+        if (minP === null || last < minP) minP = last;
+      },
+      false,
+      { descending: false, pBound: { isMin: true, getBest: () => minP } },
+    );
+    let maxP = null;
+    dfsExact(
+      prevX,
+      prevG,
+      tolFr,
+      budget,
+      (steps, P) => {
+        const last = P[e - 1];
+        if (maxP === null || last > maxP) maxP = last;
+      },
+      false,
+      { descending: true, pBound: { isMin: false, getBest: () => maxP } },
+    );
     return {
       firstFailingTrace: e + 1, // 1-based position among recorded traces
       previousIndexRange: [minP + 1, maxP + 1], // 1-based meridian indices
