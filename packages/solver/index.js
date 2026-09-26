@@ -89,25 +89,74 @@ function prefixSums(steps) {
 // admit a common d > 0 (s is then the midpoint of the remaining intercept
 // interval). DFS assigns steps left to right and maintains the intersection
 // d-interval, which prunes the space to near-linear size in practice.
+//
+// Forward reachability prune (sound): with steps assigned through trace t,
+// every future trace u must still admit a common d for SOME completion of
+// the remaining steps. For the pair (i, u) with i <= t < u the step count
+// M = P_u - P_i ranges over [P_t - P_i + (u-t), P_t - P_i + remMax], so a
+// common d can survive only if the current d-interval intersects
+// [(dx - 2R)/Mmax, (dx + 2R)/Mmin]. If any such pair rules out the whole
+// interval, no completion of this prefix is feasible. This keeps clustered
+// traces followed by a distant outlier (where the pairwise intersection
+// alone stays loose until the last trace) from exploding the tree.
+//
+// The same necessary conditions are also hoisted into a per-node window for
+// P_t: combining the pairwise estimate hi2 <= (x_t - x_i + 2R)/(P_t - P_i)
+// (resp. the lo2 analogue) with the reachability requirement of each future
+// pair (i, u) and solving for c = P_t - P_i gives
+//   P_t - P_i <= (x_t - x_i + 2R)*remMax / (x_u - x_t - 4R)  when x_u - x_t > 4R,
+//   P_t - P_i >= (x_t - x_i - 2R)*remMin / (x_u - x_t + 4R)  when x_t - x_i > 2R,
+// which bounds the integer step range worth enumerating at this node.
 // ---------------------------------------------------------------------------
+
+function suffixStepLimits(maxGaps) {
+  const n = maxGaps.length + 1;
+  const suf = new Array(n).fill(0);
+  for (let j = n - 2; j >= 0; j--) suf[j] = suf[j + 1] + maxGaps[j] + 1;
+  return suf; // suf[t] = max total steps from trace t to the last trace
+}
 
 function dfsDouble(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
   const n = x.length;
   const P = new Array(n).fill(0);
   const steps = new Array(n - 1).fill(0);
   const twoR = 2 * R;
+  const sufLim = suffixStepLimits(maxGaps);
   let leaves = 0;
 
   function rec(t, lo, hi) {
     if (++budget.count > budget.limit) throw new SearchBudgetError();
     const gMax = maxGaps[t - 1] + 1;
-    for (let g = 1; g <= gMax; g++) {
+    const xt = x[t];
+    // Hoisted forward window for P_t (see note above); eps absorbs the
+    // rounding of the bound arithmetic so no truly feasible integer is lost.
+    let pLo = P[t - 1] + 1;
+    let pHi = P[t - 1] + gMax;
+    for (let i = 0; i < t; i++) {
+      const dxt = xt - x[i];
+      const upA = dxt + twoR;
+      const dnA = dxt - twoR;
+      for (let u = t + 1; u < n; u++) {
+        const span = x[u] - xt;
+        const den = span - 2 * twoR;
+        if (den > 0) {
+          const bound = P[i] + (upA * (sufLim[t] - sufLim[u])) / den;
+          if (bound < pHi) pHi = bound;
+        }
+        if (dnA > 0) {
+          const bound = P[i] + (dnA * (u - t)) / (span + 2 * twoR);
+          if (bound > pLo) pLo = bound;
+        }
+      }
+    }
+    const gLo = Math.max(1, Math.ceil(pLo - 1e-6) - P[t - 1]);
+    const gHi = Math.min(gMax, Math.floor(pHi + 1e-6) - P[t - 1]);
+    for (let g = gLo; g <= gHi; g++) {
       const Pt = P[t - 1] + g;
       P[t] = Pt;
       steps[t - 1] = g;
       let lo2 = lo;
       let hi2 = hi;
-      const xt = x[t];
       for (let i = 0; i < t; i++) {
         const M = Pt - P[i];
         const dx = xt - x[i];
@@ -117,6 +166,20 @@ function dfsDouble(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
         if (h < hi2) hi2 = h;
       }
       if (lo2 <= hi2 && hi2 > 0) {
+        let reachable = true;
+        for (let u = n - 1; u > t && reachable; u--) {
+          const remMin = u - t;
+          const remMax = sufLim[t] - sufLim[u];
+          for (let i = 0; i <= t; i++) {
+            const base = Pt - P[i];
+            const dx = x[u] - x[i];
+            if (hi2 < (dx - twoR) / (base + remMax) || lo2 > (dx + twoR) / (base + remMin)) {
+              reachable = false;
+              break;
+            }
+          }
+        }
+        if (!reachable) continue;
         if (t === n - 1) {
           leaves++;
           const stop = onLeaf(steps, P);
@@ -138,6 +201,7 @@ function dfsExact(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
   const P = new Array(n).fill(0);
   const steps = new Array(n - 1).fill(0);
   const twoR = R.mul(fr2);
+  const sufLim = suffixStepLimits(maxGaps);
   let leaves = 0;
 
   function rec(t, lo, hi) {
@@ -160,6 +224,25 @@ function dfsExact(x, maxGaps, R, budget, onLeaf, stopAtFirst) {
         if (hi2 === null || h.lt(hi2)) hi2 = h;
       }
       if (lo2 === null || (lo2.le(hi2) && hi2.gt(fr0))) {
+        let reachable = true;
+        for (let u = t + 1; u < n && reachable; u++) {
+          const remMin = u - t;
+          const remMax = sufLim[t] - sufLim[u];
+          for (let i = 0; i <= t; i++) {
+            const base = Pt - P[i];
+            const dx = new Fr(BigInt(x[u] - x[i]));
+            const dLo = dx.sub(twoR).div(new Fr(BigInt(base + remMax)));
+            const dHi = dx.add(twoR).div(new Fr(BigInt(base + remMin)));
+            if (
+              (hi2 !== null && hi2.lt(dLo)) ||
+              (lo2 !== null && lo2.gt(dHi))
+            ) {
+              reachable = false;
+              break;
+            }
+          }
+        }
+        if (!reachable) continue;
         if (t === n - 1) {
           leaves++;
           const stop = onLeaf(steps, P);
@@ -255,6 +338,89 @@ function minimaxRDouble(x, P) {
     if (m / 2 < best) best = m / 2;
   }
   return best;
+}
+
+// ---------------------------------------------------------------------------
+// R* bracketing seeds. The feasibility binary search below only needs to run
+// when these two bounds do not already coincide to within the rung slack.
+//
+// heuristicUpperBound: try spacings dx/k suggested by every adjacent gap and
+// by the full span, round each gap to its nearest allowed step count, and
+// keep the best resulting spread. Some real step vector attains it, so it is
+// an upper bound on R*.
+//
+// relaxationLowerBound: allow each pair (i, j) its own step count anywhere in
+// [j - i, sum of step limits]. Then dist(dx_ij, d*[L_ij, U_ij]) lower-bounds
+// every pairwise residual, and h(d) = max over pairs of that distance is
+// convex piecewise-linear in d (max of 0, increasing pieces L*d - dx, and
+// decreasing pieces dx - U*d). Its minimum — attained where an increasing
+// piece meets a decreasing piece — lower-bounds 2R*.
+// ---------------------------------------------------------------------------
+
+function heuristicUpperBound(x, maxGaps) {
+  const n = x.length;
+  const lim = maxGaps.map((g) => g + 1);
+  const cands = [];
+  for (let j = 0; j < n - 1; j++) {
+    const dx = x[j + 1] - x[j];
+    for (let k = 1; k <= lim[j]; k++) cands.push([dx, k]);
+  }
+  const span = x[n - 1] - x[0];
+  const total = lim.reduce((a, b) => a + b, 0);
+  for (let k = n - 1; k <= total; k++) cands.push([span, k]);
+
+  let best = Infinity;
+  const P = new Array(n);
+  for (const [num, den] of cands) {
+    P[0] = 0;
+    for (let j = 0; j < n - 1; j++) {
+      const g = Math.round(((x[j + 1] - x[j]) * den) / num);
+      P[j + 1] = P[j] + Math.min(lim[j], Math.max(1, g));
+    }
+    // |dx - d*M| = |dx*den - num*M| / den with an exactly representable
+    // integer numerator (< 2^53), leaving a single rounding at ~1e-9.
+    let m = 0;
+    for (let a = 0; a < n; a++) {
+      for (let b = a + 1; b < n; b++) {
+        const v = Math.abs((x[b] - x[a]) * den - num * (P[b] - P[a]));
+        if (v > m) m = v;
+      }
+    }
+    if (m / (2 * den) < best) best = m / (2 * den);
+  }
+  return best;
+}
+
+function relaxationLowerBound(x, maxGaps) {
+  const n = x.length;
+  const limPre = [0];
+  for (const g of maxGaps) limPre.push(limPre[limPre.length - 1] + g + 1);
+  const pairs = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      pairs.push([x[j] - x[i], j - i, limPre[j] - limPre[i]]); // dx, L, U
+    }
+  }
+  let best = Infinity;
+  for (const [dxA, LA] of pairs) {
+    for (const [dxB, , UB] of pairs) {
+      // Intersection of the increasing piece L_A*d - dx_A with the
+      // decreasing piece dx_B - U_B*d: d = (dxA + dxB) / (LA + UB).
+      const num = dxA + dxB;
+      const den = LA + UB;
+      if (num <= 0) continue;
+      // Evaluate h(d)*den with exactly representable integers (< 2^53).
+      let h = 0;
+      for (const [dx, L, U] of pairs) {
+        const a = L * num - dx * den;
+        const b = dx * den - U * num;
+        if (a > h) h = a;
+        if (b > h) h = b;
+      }
+      if (h / den < best) best = h / den;
+    }
+  }
+  return best / 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,10 +573,14 @@ export function solve(raw) {
   const tolFr = toFraction(raw.tolerance);
   const budget = { count: 0, limit: DFS_BUDGET };
 
-  // Phase 1 — binary-search the minimax level with the double oracle.
-  let lo = 0;
-  let hi = Math.max(1, (x[n - 1] - x[0]) / 2);
-  for (let it = 0; it < 70; it++) {
+  // Phase 1 — bracket the minimax level. The heuristic upper bound and the
+  // relaxation lower bound usually coincide to within the rung slack, in
+  // which case the feasibility binary search is skipped entirely; otherwise
+  // bisect between the seeds until the bracket is tighter than the slack.
+  let lo = relaxationLowerBound(x, maxGaps);
+  let hi = Math.min(heuristicUpperBound(x, maxGaps), Math.max(1, (x[n - 1] - x[0]) / 2));
+  if (hi < lo) hi = lo; // seeds are doubles; keep a non-empty bracket
+  for (let it = 0; it < 70 && hi - lo > RUNG_SLACK; it++) {
     const mid = (lo + hi) / 2;
     if (dfsDouble(x, maxGaps, mid, budget, () => {}, true) > 0) hi = mid;
     else lo = mid;
@@ -429,11 +599,15 @@ export function solve(raw) {
       near.push(steps.slice());
     }
   }, false);
+  // Filter the rung with exact arithmetic: keep precisely {g : R(g) = R*}.
+  // (Same leaf set the exact DFS at R* would enumerate, in the same
+  // lexicographic visitation order.)
   let Rstar = null;
-  for (const steps of near) {
-    const r = minimaxRExact(x, prefixSums(steps));
+  const exactR = near.map((steps) => minimaxRExact(x, prefixSums(steps)));
+  for (const r of exactR) {
     if (Rstar === null || r.lt(Rstar)) Rstar = r;
   }
+  const rung = near.filter((_, i) => exactR[i].cmp(Rstar) === 0);
 
   if (Rstar === null || Rstar.gt(tolFr)) {
     const diag = diagnose(x, maxGaps, tolFr, budget);
@@ -446,16 +620,17 @@ export function solve(raw) {
     };
   }
 
-  // Phase 3 — exact enumeration at R*: SSE tie-break, then lexicographic
-  // missing-line sequence (DFS visits step vectors in lexicographic order).
+  // Phase 3 — exact SSE adjudication over the optimal rung; ties keep the
+  // first vector in lexicographic step order (smallest missing-line
+  // sequence).
   let best = null;
-  dfsExact(x, maxGaps, Rstar, budget, (steps) => {
+  for (const steps of rung) {
     const P = prefixSums(steps);
     const r = bestSseExact(x, P, Rstar);
     if (r && (!best || r.sse.lt(best.sse))) {
-      best = { steps: steps.slice(), P, d: r.d, s: r.s, sse: r.sse };
+      best = { steps, P, d: r.d, s: r.s, sse: r.sse };
     }
-  }, false);
+  }
 
   const { P, d, s, sse } = best;
   const indices = P.map((p) => p + 1); // 1-based meridian indices

@@ -318,3 +318,30 @@ test('wide search space (10 traces, up to 100 missing per gap) stays fast', () =
   assert.ok(r.spacing > 0);
   assert.ok(ms < 5000, `took ${ms}ms`);
 });
+
+test('clustered traces with a distant outlier stay within the search budget', () => {
+  // Nine clustered traces then one a million units away: the pairwise
+  // d-interval stays loose until the last trace, which used to blow the
+  // search budget (HTTP 500 SEARCH_BUDGET) despite a feasible common grid.
+  const t0 = performance.now();
+  const r = solve({
+    x: [0, 1, 2, 3, 4, 5, 6, 7, 8, 1_000_000],
+    maxGaps: Array(9).fill(100),
+    tolerance: 1_000_000,
+  });
+  const ms = performance.now() - t0;
+  assert.ok(r.ok, 'expected a feasible restoration');
+  assert.deepEqual(r.gapsFilled, [0, 0, 0, 0, 0, 0, 0, 0, 100]);
+  assert.deepEqual(r.indices, [1, 2, 3, 4, 5, 6, 7, 8, 9, 110]);
+  assert.ok(Math.abs(r.spacing - 1_000_000 / 109) < 1e-9, `spacing=${r.spacing}`);
+  assert.ok(Math.abs(r.start - -3_999_564 / 109) < 1e-6, `start=${r.start}`);
+  assert.ok(
+    Math.abs(r.maxDeviation - 3_999_564 / 109) < 1e-6,
+    `maxDeviation=${r.maxDeviation}`,
+  );
+  for (const it of r.items) {
+    assert.ok(Math.abs(it.deviation) <= r.maxDeviation + 1e-9);
+    assert.ok(Math.abs(it.fitted + it.deviation - it.x) < 1e-9);
+  }
+  assert.ok(ms < 5000, `took ${ms}ms`);
+});
